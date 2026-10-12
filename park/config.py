@@ -3,7 +3,7 @@
 # 各自机器的本地 COM 端口。若主机与从机在同一台机器测试，请把 MASTER_PORT
 # 改成另一个端口，避免同时占用同一个物理串口。
 SLAVE_PORT = "COM3"   # 运行从机（模拟器）的机器
-MASTER_PORT = "COM5"  # 运行主机的机器
+MASTER_PORT = "COM3"  # 运行主机的机器
 
 
 BAUDRATE = 9600
