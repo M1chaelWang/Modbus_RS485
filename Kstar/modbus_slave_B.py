@@ -12,17 +12,17 @@ from pymodbus.datastore import (
 from pymodbus.framer.rtu_framer import ModbusRtuFramer
 from pymodbus.server import StartSerialServer
 
-from Modbus_RS485.Kstar.config import (
+from config import (
     BAUDRATE,
     BYTESIZE,
     PARITY,
     READ_HOLDING_REGISTERS,
     READ_INPUT_REGISTERS,
     SLAVE_ID,
-    SLAVE_PORT,
+    SLAVE_B_PORT,
     STOPBITS,
 )
-from Modbus_RS485.Kstar.ksg1_registers import READ_BLOCKS, build_pymodbus_datastore_values
+from ksg1_registers import READ_BLOCKS, build_pymodbus_datastore_values
 
 
 class LoggingRtuFramer(ModbusRtuFramer):
@@ -51,11 +51,12 @@ def create_server_context() -> ModbusServerContext:
     """创建包含 KSG1 03H Holding 与 04H Input Registers 的只读数据区。"""
     slave_context = ModbusSlaveContext(
         hr=ModbusSparseDataBlock(
-            build_pymodbus_datastore_values(READ_HOLDING_REGISTERS),
+            # 从机 B：数值编码值统一为双数，便于与从机 A 区分。
+            build_pymodbus_datastore_values(READ_HOLDING_REGISTERS, "B"),
             mutable=False,
         ),
         ir=ModbusSparseDataBlock(
-            build_pymodbus_datastore_values(READ_INPUT_REGISTERS),
+            build_pymodbus_datastore_values(READ_INPUT_REGISTERS, "B"),
             mutable=False,
         ),
     )
@@ -75,7 +76,7 @@ def main() -> None:
     )
 
     print(
-        f"启动 KSG1-250K Modbus RTU 仿真从机：端口={SLAVE_PORT}，"
+        f"启动 KSG1-250K Modbus RTU 仿真从机：端口={SLAVE_B_PORT}，"
         f"站号={SLAVE_ID}，串口={BAUDRATE}/{BYTESIZE}{PARITY}{STOPBITS}"
     )
     print(f"03H Holding Registers：{_format_blocks(READ_HOLDING_REGISTERS)}")
@@ -86,7 +87,7 @@ def main() -> None:
     try:
         StartSerialServer(
             context=create_server_context(),
-            port=SLAVE_PORT,
+            port=SLAVE_B_PORT,
             # PyModbus 3.3 的 StartAsyncSerialServer 默认 ASCII，必须显式指定 RTU；
             # LoggingRtuFramer 在 RTU 基础上打印收发帧日志。
             framer=LoggingRtuFramer,
@@ -98,7 +99,7 @@ def main() -> None:
     except (OSError, ValueError) as error:
         logging.error(
             "无法在 %s 启动从机：%s。请检查 COM 端口、驱动、端口占用和 RS-485 接线。",
-            SLAVE_PORT,
+            SLAVE_B_PORT,
             error,
         )
     except KeyboardInterrupt:

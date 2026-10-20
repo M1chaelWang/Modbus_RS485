@@ -1,4 +1,4 @@
-"""读取 KSG1-250K Modbus RTU 只读仿真从机的 03H / 04H 点位。"""
+"""读取 KSG1-250K Modbus RTU 只读仿真从机的基础点位（测试用，仅少量点位）。"""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ from collections.abc import Iterator
 
 from pymodbus.client import ModbusSerialClient
 
-from Modbus_RS485.Kstar.config import (
+from config import (
     BAUDRATE,
     BYTESIZE,
     INTER_REQUEST_DELAY,
-    MASTER_B_PORT,
+    MASTER_PORT,
     MAX_REGISTERS_PER_REQUEST,
     PARITY,
     READ_ATTEMPTS,
@@ -22,12 +22,25 @@ from Modbus_RS485.Kstar.config import (
     SLAVE_ID,
     STOPBITS,
 )
-from Modbus_RS485.Kstar.ksg1_registers import (
-    READ_BLOCKS,
+from ksg1_registers import (
+    POINTS,
     ReadBlock,
+    RegisterPoint,
     decode_point,
     format_point_value,
-    iter_points,
+)
+
+# 测试用：只读取最基础的几个点位（不超过 10 个），用于快速验证通信链路。
+TEST_POINT_NAMES = (
+    "逆变器型号",        # 03H 设备身份
+    "正母线电压 PBUS",   # 04H 母线遥测
+    "电网 RS 线电压",    # 04H 电网遥测
+    "交流有功功率",      # 04H
+    "功率因数",          # 04H
+    "运行状态",          # 04H
+    "当日发电量",        # 04H
+    "累计发电量",        # 04H
+    "额定功率",          # 04H
 )
 
 
@@ -123,22 +136,28 @@ def _read_registers(
     )
 
 
-def display_points(function_code: int, registers: dict[int, int]) -> None:
-    """按协议点表解析并显示当前功能码读取到的业务点。"""
-    function_name = "03H Holding Registers" if function_code == READ_HOLDING_REGISTERS else "04H Input Registers"
-    print(f"\n{function_name}：")
-    for point in iter_points(function_code):
-        value = decode_point(point, registers)
-        end_address = point.address + point.register_count - 1
-        address_text = (
-            str(point.address)
-            if end_address == point.address
-            else f"{point.address}–{end_address}"
-        )
-        print(
-            f"  地址 {address_text:<9} {point.name:<26} "
-            f"{format_point_value(point, value)}"
-        )
+def select_test_points() -> list[RegisterPoint]:
+    """从点表中挑出测试需要的点位，按功能码与地址排序。"""
+    wanted = set(TEST_POINT_NAMES)
+    return sorted(
+        (point for point in POINTS if point.name in wanted),
+        key=lambda point: (point.function_code, point.address, point.byte_offset),
+    )
+
+
+def display_point(point: RegisterPoint, registers: dict[int, int]) -> None:
+    """解析并显示单个业务点。"""
+    value = decode_point(point, registers)
+    end_address = point.address + point.register_count - 1
+    address_text = (
+        str(point.address)
+        if end_address == point.address
+        else f"{point.address}–{end_address}"
+    )
+    print(
+        f"  {point.function_code:02X}H 地址 {address_text:<9} "
+        f"{point.name:<20} {format_point_value(point, value)}"
+    )
 
 
 def main() -> None:
@@ -148,7 +167,7 @@ def main() -> None:
     )
 
     client = ModbusSerialClient(
-        port=MASTER_B_PORT,
+        port=MASTER_PORT,
         # PyModbus 3.3 的串口客户端默认使用 RTU framer。
         baudrate=BAUDRATE,
         parity=PARITY,
@@ -157,32 +176,30 @@ def main() -> None:
         timeout=RESPONSE_TIMEOUT,
     )
 
+    points = select_test_points()
     print(
-        f"连接 KSG1-250K Modbus RTU 仿真从机：端口={MASTER_B_PORT}，"
+        f"连接 KSG1-250K Modbus RTU 仿真从机：端口={MASTER_PORT}，"
         f"站号={SLAVE_ID}，串口={BAUDRATE}/{BYTESIZE}{PARITY}{STOPBITS}"
     )
+    print(f"测试读取 {len(points)} 个基础点位")
 
     try:
         if not client.connect():
             logging.error(
                 "无法打开 %s。请检查 COM 端口、驱动和端口占用。",
-                MASTER_B_PORT,
+                MASTER_PORT,
             )
             return
 
-        registers_by_function: dict[int, dict[int, int]] = {
-            READ_HOLDING_REGISTERS: {},
-            READ_INPUT_REGISTERS: {},
-        }
-        for block in READ_BLOCKS:
-            print(
-                f"读取 {block.name}：{block.function_code:02X}H "
-                f"地址 {block.address}–{block.end_address}"
+        for point in points:
+            block = ReadBlock(
+                point.function_code,
+                point.address,
+                point.register_count,
+                point.name,
             )
-            registers_by_function[block.function_code].update(read_block(client, block))
-
-        for function_code in (READ_HOLDING_REGISTERS, READ_INPUT_REGISTERS):
-            display_points(function_code, registers_by_function[function_code])
+            registers = read_block(client, block)
+            display_point(point, registers)
     except (OSError, ValueError, RuntimeError) as error:
         logging.error(
             "Modbus 读取失败：%s。请检查从机是否运行、站号、RS-485 接线和串口参数。",

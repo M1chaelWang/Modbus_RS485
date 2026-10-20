@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from struct import pack, unpack
 from typing import Final, Iterable, Mapping
 
-from Modbus_RS485.Kstar.config import (
+from config import (
     PYMODBUS_33_SERVER_ADDRESS_OFFSET,
     READ_HOLDING_REGISTERS,
     READ_INPUT_REGISTERS,
@@ -309,8 +309,19 @@ def _block_addresses(function_code: int) -> set[int]:
     return addresses
 
 
-def _encode_point(point: RegisterPoint) -> bytes:
-    """将一个工程值编码为文档要求的 Big-Endian 字节序。"""
+def force_parity(raw_value: int, *, odd: bool) -> int:
+    """把整数调整到指定奇偶性；已是目标奇偶则原样返回，否则加 1 翻转。"""
+    if (raw_value & 1) == int(odd):
+        return raw_value
+    return raw_value + 1
+
+
+def _encode_point(point: RegisterPoint, variant: str | None = None) -> bytes:
+    """将一个工程值编码为文档要求的 Big-Endian 字节序。
+
+    variant 为 "A" 时把数值编码值调成单数、"B" 时调成双数，用于区分两个从机；
+    ascii/mac 等非数值类型不受影响，保持两从机一致。
+    """
     if point.data_type == "ascii":
         raw = str(point.value).encode("ascii")
         assert point.width is not None
@@ -325,6 +336,8 @@ def _encode_point(point: RegisterPoint) -> bytes:
         return raw
 
     raw_value = round(float(point.value) / point.scale)
+    if variant is not None:
+        raw_value = force_parity(raw_value, odd=(variant == "A"))
     formats = {"u8": ">B", "u16": ">H", "s16": ">h", "u32": ">I", "s32": ">i"}
     try:
         return pack(formats[point.data_type], raw_value)
@@ -332,15 +345,21 @@ def _encode_point(point: RegisterPoint) -> bytes:
         raise ValueError(f"无法编码 {point.name} 的值 {point.value}") from error
 
 
-def build_document_registers(function_code: int) -> dict[int, int]:
-    """构造按文档地址索引的 16-bit 值；未具名的已定义字节默认返回 0。"""
+def build_document_registers(
+    function_code: int,
+    variant: str | None = None,
+) -> dict[int, int]:
+    """构造按文档地址索引的 16-bit 值；未具名的已定义字节默认返回 0。
+
+    variant 透传给 _encode_point，用于让两个从机返回不同奇偶性的数值。
+    """
     addresses = _block_addresses(function_code)
     words = {address: bytearray(2) for address in addresses}
 
     for point in POINTS:
         if point.function_code != function_code:
             continue
-        payload = _encode_point(point)
+        payload = _encode_point(point, variant)
         start_byte = point.address * 2 + point.byte_offset
         for index, value in enumerate(payload):
             absolute_byte = start_byte + index
@@ -354,11 +373,14 @@ def build_document_registers(function_code: int) -> dict[int, int]:
     return {address: int.from_bytes(value, byteorder="big") for address, value in words.items()}
 
 
-def build_pymodbus_datastore_values(function_code: int) -> dict[int, int]:
+def build_pymodbus_datastore_values(
+    function_code: int,
+    variant: str | None = None,
+) -> dict[int, int]:
     """构造 PyModbus 3.3 数据块地址；该版本服务端访问时会额外加 1。"""
     return {
         address + PYMODBUS_33_SERVER_ADDRESS_OFFSET: value
-        for address, value in build_document_registers(function_code).items()
+        for address, value in build_document_registers(function_code, variant).items()
     }
 
 

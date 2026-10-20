@@ -1,10 +1,9 @@
 """KSG1-250K Modbus RTU 仿真的通信与读取配置。"""
 
 # 端口号是各自机器的本地 COM 端口。
-# 从机使用 COM3；主机A使用 COM4；主机B使用 COM5。
-SLAVE_PORT = "COM3"
-MASTER_A_PORT = "COM4"
-MASTER_B_PORT = "COM5"
+SLAVE_A_PORT = "COM3"
+SLAVE_B_PORT = "COM4"
+MASTER_PORT = "COM5"
 
 # 《KSG1-250K 逆变器 MODBUS 通讯协议 V3.6》规定的默认串口格式。
 BAUDRATE = 9600
