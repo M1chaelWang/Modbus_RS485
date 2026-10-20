@@ -1,10 +1,14 @@
-"""读取 KSG1-250K Modbus RTU 只读仿真从机的基础点位（测试用，仅少量点位）。"""
+"""读取 KSG1-250K Modbus RTU 仿真从机的基础点位（测试用，窗口捕获两个从机的响应）。
+
+两个从机（COM3 从机A、COM4 从机B）站号相同，都会响应同一条请求。
+本脚本对每个点位发送一条请求，然后在窗口内捕获串口上出现的所有响应帧，
+按数值奇偶区分来源（单数=从机A，双数=从机B）并同时显示两边的值。
+"""
 
 from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator
 
 from pymodbus.client import ModbusSerialClient
 
@@ -13,24 +17,20 @@ from config import (
     BYTESIZE,
     INTER_REQUEST_DELAY,
     MASTER_PORT,
-    MAX_REGISTERS_PER_REQUEST,
     PARITY,
     READ_ATTEMPTS,
-    READ_HOLDING_REGISTERS,
-    READ_INPUT_REGISTERS,
     RESPONSE_TIMEOUT,
     SLAVE_ID,
     STOPBITS,
 )
 from ksg1_registers import (
     POINTS,
-    ReadBlock,
     RegisterPoint,
     decode_point,
     format_point_value,
 )
 
-# 测试用：只读取最基础的几个点位（不超过 10 个），用于快速验证通信链路。
+# 测试用：只读取最基础的几个点位（不超过 10 个）。
 TEST_POINT_NAMES = (
     "逆变器型号",        # 03H 设备身份
     "正母线电压 PBUS",   # 04H 母线遥测
@@ -43,24 +43,39 @@ TEST_POINT_NAMES = (
     "额定功率",          # 04H
 )
 
+# 发送请求后捕获响应的窗口时长（秒）；无线链路空口速率慢时可能需要加大。
+CAPTURE_WINDOW = 3.0
+# 窗口内每次串口读取的超时（秒）。
+READ_CHUNK = 0.1
+# 集齐两个从机的响应后，再观察这段静默期以接住可能迟到的帧（秒）。
+QUIET_PERIOD = 0.3
+# 总线上同站号从机的数量；集齐后提前结束窗口。
+EXPECTED_RESPONSES = 2
 
-def split_read_block(block: ReadBlock) -> Iterator[tuple[int, int]]:
-    """把一个读取块切成大小尽量均匀、且不超过 125 寄存器的请求。
 
-    不用"125 + 余数"的方式，避免末尾出现 1 个寄存器这样的极小帧——
-    无线透传模块对末尾的小帧容易丢包或积压。
-    """
-    chunk_count = (block.count + MAX_REGISTERS_PER_REQUEST - 1) // MAX_REGISTERS_PER_REQUEST
-    base, extra = divmod(block.count, chunk_count)
-    address = block.address
-    remaining = block.count
-    while remaining:
-        size = base + (1 if extra > 0 else 0)
-        if extra > 0:
-            extra -= 1
-        yield address, size
-        address += size
-        remaining -= size
+def crc16(data: bytes) -> bytes:
+    """Modbus RTU CRC-16（poly 0xA001、init 0xFFFF），低字节在前。"""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc.to_bytes(2, "little")
+
+
+def build_request(function_code: int, address: int, count: int) -> bytes:
+    """构造一条 Modbus RTU 读请求帧。"""
+    request = bytes(
+        (
+            SLAVE_ID,
+            function_code,
+            address >> 8,
+            address & 0xFF,
+            count >> 8,
+            count & 0xFF,
+        )
+    )
+    return request + crc16(request)
 
 
 def flush_input_buffer(client: ModbusSerialClient) -> None:
@@ -70,70 +85,92 @@ def flush_input_buffer(client: ModbusSerialClient) -> None:
         socket.reset_input_buffer()
 
 
-def read_block(
-    client: ModbusSerialClient,
-    block: ReadBlock,
-) -> dict[int, int]:
-    """读取一个文档地址块并返回以文档/PDU 地址索引的寄存器值。"""
-    values: dict[int, int] = {}
-    for address, count in split_read_block(block):
-        response = _read_registers(client, block, address, count)
-        values.update(zip(range(address, address + count), response.registers))
-    return values
+def scan_frames(
+    buffer: bytes,
+    function_code: int,
+    byte_count: int,
+) -> tuple[list[bytes], list[bytes]]:
+    """在字节流中滑窗扫描 CRC 有效的响应帧，返回 (读响应帧, 异常响应帧)。"""
+    reads: list[bytes] = []
+    exceptions: list[bytes] = []
+    offset = 0
+    while offset + 4 < len(buffer):
+        if buffer[offset] != SLAVE_ID:
+            offset += 1
+            continue
+        frame_function_code = buffer[offset + 1]
+        if frame_function_code == function_code:
+            if buffer[offset + 2] == byte_count:
+                frame_length = 3 + byte_count + 2
+                if offset + frame_length <= len(buffer):
+                    frame = buffer[offset : offset + frame_length]
+                    if crc16(frame[:-2]) == frame[-2:]:
+                        reads.append(frame)
+        elif frame_function_code == function_code | 0x80:
+            # 异常响应：站号 + (功能码|0x80) + 异常码 + CRC，共 5 字节。
+            frame = buffer[offset : offset + 5]
+            if crc16(frame[:-2]) == frame[-2:]:
+                exceptions.append(frame)
+        offset += 1
+    return reads, exceptions
 
 
-def _read_registers(
+def capture_responses(
     client: ModbusSerialClient,
-    block: ReadBlock,
+    function_code: int,
     address: int,
     count: int,
-):
-    """发送一条读请求，失败时自动重试；返回一条有效响应。"""
-    request_name = (
-        "03H Holding Registers"
-        if block.function_code == READ_HOLDING_REGISTERS
-        else "04H Input Registers"
+) -> tuple[list[bytes], list[bytes]]:
+    """发送一条请求，在窗口内收集全部有效响应；集齐后静默一小段提前结束。"""
+    socket = client.socket
+    socket.write(build_request(function_code, address, count))
+
+    buffer = bytearray()
+    reads: list[bytes] = []
+    exceptions: list[bytes] = []
+    quiet_since: float | None = None
+    deadline = time.monotonic() + CAPTURE_WINDOW
+    old_timeout = socket.timeout
+    socket.timeout = READ_CHUNK
+    try:
+        while time.monotonic() < deadline:
+            data = socket.read(256)
+            now = time.monotonic()
+            if data:
+                buffer.extend(data)
+                quiet_since = None
+                reads, exceptions = scan_frames(bytes(buffer), function_code, 2 * count)
+            elif quiet_since is None:
+                quiet_since = now
+            if (
+                len(reads) + len(exceptions) >= EXPECTED_RESPONSES
+                and quiet_since is not None
+                and now - quiet_since >= QUIET_PERIOD
+            ):
+                break
+    finally:
+        socket.timeout = old_timeout
+    return reads, exceptions
+
+
+def frame_registers(point: RegisterPoint, frame: bytes) -> dict[int, int]:
+    """把响应帧的数据字节按文档地址还原成寄存器字典。"""
+    data = frame[3:-2]
+    return {
+        point.address + index: int.from_bytes(data[index * 2 : index * 2 + 2], "big")
+        for index in range(len(data) // 2)
+    }
+
+
+def point_header(point: RegisterPoint) -> str:
+    """格式化为“功能码 地址 名称”的固定宽度表头。"""
+    end_address = point.address + point.register_count - 1
+    address_text = (
+        str(point.address)
+        if end_address == point.address
+        else f"{point.address}–{end_address}"
     )
-    last_message = ""
-    for _ in range(READ_ATTEMPTS):
-        # 无线透传可能把上一笔事务的旧响应延迟或重复送达。
-        # 先停顿让在途旧帧到达，再清空接收缓冲，避免把旧帧当成本次响应。
-        time.sleep(INTER_REQUEST_DELAY)
-        flush_input_buffer(client)
-
-        if block.function_code == READ_HOLDING_REGISTERS:
-            response = client.read_holding_registers(
-                address=address,
-                count=count,
-                slave=SLAVE_ID,
-            )
-        elif block.function_code == READ_INPUT_REGISTERS:
-            response = client.read_input_registers(
-                address=address,
-                count=count,
-                slave=SLAVE_ID,
-            )
-        else:  # 防御性检查：共享点表只能声明 03H 或 04H。
-            raise ValueError(f"不支持的读取功能码：{block.function_code:02X}H")
-
-        if response.isError():
-            last_message = f"返回异常：{response}"
-            continue
-        if response.function_code != block.function_code:
-            last_message = (
-                f"收到功能码 {response.function_code:02X}H 的响应，期望 "
-                f"{block.function_code:02X}H；总线上可能有另一个主机同时在轮询"
-            )
-            continue
-        if len(response.registers) != count:
-            last_message = f"收到 {len(response.registers)} 个寄存器，响应长度不完整"
-            continue
-        return response
-
-    raise RuntimeError(
-        f"{request_name} 地址 {address}、数量 {count} 重试 {READ_ATTEMPTS} 次仍失败："
-        f"{last_message or '无有效响应'}"
-    )
+    return f"{point.function_code:02X}H 地址 {address_text:<9} {point.name:<20}"
 
 
 def select_test_points() -> list[RegisterPoint]:
@@ -145,19 +182,29 @@ def select_test_points() -> list[RegisterPoint]:
     )
 
 
-def display_point(point: RegisterPoint, registers: dict[int, int]) -> None:
-    """解析并显示单个业务点。"""
-    value = decode_point(point, registers)
-    end_address = point.address + point.register_count - 1
-    address_text = (
-        str(point.address)
-        if end_address == point.address
-        else f"{point.address}–{end_address}"
-    )
-    print(
-        f"  {point.function_code:02X}H 地址 {address_text:<9} "
-        f"{point.name:<20} {format_point_value(point, value)}"
-    )
+def display_point(point: RegisterPoint, frames: list[bytes]) -> None:
+    """解析所有响应帧，按数值奇偶归入从机A/B后同时显示。"""
+    header = point_header(point)
+
+    if point.data_type in {"ascii", "mac"}:
+        # 身份类字段两从机一致：去重后显示一次。
+        values: list[str] = []
+        for frame in frames:
+            value = decode_point(point, frame_registers(point, frame))
+            text = format_point_value(point, value)
+            if text not in values:
+                values.append(text)
+        print(f"  {header} {' / '.join(values)}（两从机一致）")
+        return
+
+    by_source: dict[str, int | float] = {}
+    for frame in frames:
+        value = decode_point(point, frame_registers(point, frame))
+        raw_int = round(value / point.scale)
+        by_source["A" if raw_int & 1 else "B"] = value
+    a_text = format_point_value(point, by_source["A"]) if "A" in by_source else "—"
+    b_text = format_point_value(point, by_source["B"]) if "B" in by_source else "—"
+    print(f"  {header} 从机A: {a_text:<14} 从机B: {b_text}")
 
 
 def main() -> None:
@@ -181,7 +228,7 @@ def main() -> None:
         f"连接 KSG1-250K Modbus RTU 仿真从机：端口={MASTER_PORT}，"
         f"站号={SLAVE_ID}，串口={BAUDRATE}/{BYTESIZE}{PARITY}{STOPBITS}"
     )
-    print(f"测试读取 {len(points)} 个基础点位")
+    print(f"测试读取 {len(points)} 个基础点位（窗口捕获，同时显示从机A/B）")
 
     try:
         if not client.connect():
@@ -192,14 +239,33 @@ def main() -> None:
             return
 
         for point in points:
-            block = ReadBlock(
-                point.function_code,
-                point.address,
-                point.register_count,
-                point.name,
-            )
-            registers = read_block(client, block)
-            display_point(point, registers)
+            # 无线透传可能把上一笔事务的旧响应延迟或重复送达。
+            # 先停顿让在途旧帧到达，再清空接收缓冲，避免旧帧混入本次窗口。
+            time.sleep(INTER_REQUEST_DELAY)
+            flush_input_buffer(client)
+
+            frames: list[bytes] = []
+            exceptions: list[bytes] = []
+            for _ in range(READ_ATTEMPTS):
+                frames, exceptions = capture_responses(
+                    client, point.function_code, point.address, point.register_count
+                )
+                if frames or exceptions:
+                    break
+
+            header = point_header(point)
+            if exceptions and not frames:
+                exception_text = " ".join(
+                    f"{byte:02X}" for frame in exceptions for byte in frame
+                )
+                logging.warning("%s 收到异常响应：%s", point.name, exception_text)
+                print(f"  {header} 从机A: —  从机B: —（异常响应 {exception_text}）")
+                continue
+            if not frames:
+                logging.warning("%s 无有效响应（重试 %d 次）", point.name, READ_ATTEMPTS)
+                print(f"  {header} 从机A: —  从机B: —（无响应）")
+                continue
+            display_point(point, frames)
     except (OSError, ValueError, RuntimeError) as error:
         logging.error(
             "Modbus 读取失败：%s。请检查从机是否运行、站号、RS-485 接线和串口参数。",
